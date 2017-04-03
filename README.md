@@ -12,9 +12,11 @@ This prototype code presents a rate limiting prefetch algorithm. It can achieve:
 
 ## How to run it
 
+```
 git clone https://github.com/qiwzhang/rate-limit-prefetch
 cd rate-limit-prefetch
 
+```
 You can always run this for help
 
 ```
