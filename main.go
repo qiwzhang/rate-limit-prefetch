@@ -28,6 +28,7 @@ func main() {
 		fmt.Scanln(&n1, &n2, &d)
 
 		dur := time.Duration(d) * time.Second
+		s.Reset()
 		p1.Send(n1, dur)
 		p2.Send(n2, dur)
 		time.Sleep(dur)

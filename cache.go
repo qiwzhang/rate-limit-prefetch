@@ -8,18 +8,17 @@ import (
 )
 
 const (
-	// The desired prefetch window in seconds
-	// The algorithm will dynamically adjust prefetch tokens
-	// so it can last the window time.
-	// For example, if it is 2,  the prefetched tokens will last 2 seconds.
-	// In another word, prefetch is only called once in every
-	// prefetchWindow.
-	prefetchWindowInSeconds = 1
+	// Count the number of requests in this window
+	// Use that to determine how much to prefetch
+	predictWindowInSeconds = 1
+
+	// Minimum prefetch amount
+	minPrefetchAmount = 10
 )
 
 var (
 	// Converts to time.Duration type for easy use.
-	prefetchWindow = time.Duration(prefetchWindowInSeconds) * time.Second
+	predictWindow = time.Duration(predictWindowInSeconds) * time.Second
 
 	// cache_id for logging in multiple cache case
 	cache_id int
@@ -49,15 +48,22 @@ type CacheStat struct {
 }
 
 type Cache struct {
-	prefetch_amount    int
+	queue              *Queue
 	mode               BucketMode
 	last_prefetch_time time.Time
-	queue              *Queue
+	requests           *RollingWindow
 	server             *Server
 	s                  CacheStat
 	mutex              sync.Mutex
 	next_node_id       NodeId
 	id                 int
+}
+
+func max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
 }
 
 func min(x, y int) int {
@@ -70,19 +76,13 @@ func min(x, y int) int {
 func NewCache(s *Server) *Cache {
 	cache_id++
 	return &Cache{
-		prefetch_amount: 1, // starts with prefetch amount 1
-		mode:            OPEN,
-		queue:           NewQueue(10),
-		server:          s,
-		next_node_id:    1, // node id starts with 2
-		id:              cache_id,
+		queue:    NewQueue(10),
+		requests: NewRollingWindow(predictWindow),
+		server:   s,
+		id:       cache_id,
 	}
 }
 
-// Special node ids:
-// id=0: prefetch amount is not added to available queue in CLOSE mode.
-// id=1: prefetch amount is 1 and used in OPEN mode.
-// Other ids starts with 2.
 func (c *Cache) nextNodeId() NodeId {
 	c.next_node_id++
 	return c.next_node_id
@@ -107,45 +107,64 @@ func (c *Cache) dec(delta int) int {
 	return delta
 }
 
+func (c *Cache) countAvailable() int {
+	var count int
+	c.queue.Iterate(func(n *Node) bool {
+		count += n.available
+		return true
+	})
+	return count
+}
+
+func (c *Cache) tryPrefetch() {
+	// If it is in Close mode, and too close to last request time,
+	// Not issue a new prefetch, most likely will not get any.
+	if c.mode == CLOSE &&
+		time.Since(c.last_prefetch_time) < predictWindow/2 {
+		return
+	}
+
+	avail := c.countAvailable()
+	// Count the requests from last second window.
+	pass_count := c.requests.Count()
+	// Desired amount.
+	amount := max(pass_count, minPrefetchAmount)
+	if glog.V(4) {
+		glog.Infof("[%d]tryPrefetch, avail: %d, pass: %d, req: %d",
+			c.id, avail, pass_count, amount)
+	}
+
+	// If available is less than half of desired amount, prefetch them.
+	if avail < amount/2 {
+		// Some rare conditions to use tokens before it is granted.
+		// Specifically designed not to reject the first request after
+		// long period of no traffic while the prefetch is still on the way.
+		use_not_granted := avail == 0 && c.mode == OPEN
+		c.prefetch(amount, use_not_granted)
+	}
+}
+
 // The main entry call to check the rate limit.
 // It is a sync call and will return true/false right away.
 func (c *Cache) Check() bool {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	// If available queue can successfully substract 1, grant the request.
-	if c.dec(1) == 0 {
-		return true
+	if glog.V(4) {
+		glog.Infof("[%d]Check called", c.id)
 	}
 
-	if c.last_prefetch_time.IsZero() {
-		return c.prefetch()
-	}
+	c.tryPrefetch()
+	c.requests.Inc()
+	ret := c.dec(1) == 0
 
-	d := time.Since(c.last_prefetch_time)
-	if d > prefetchWindow {
-		// If prefetched token lasts too long, adjust it down.
-		if d > 2*prefetchWindow {
-			c.prefetch_amount /= int(d / 2 * prefetchWindow)
-			if c.prefetch_amount < 1 {
-				c.prefetch_amount = 1
-			}
-			if glog.V(2) {
-				glog.Infof("[%d]Prefetch amount decreased to: %v", c.id, c.prefetch_amount)
-			}
+	if !ret {
+		if glog.V(4) {
+			glog.Infof("[%d]***rejected", c.id)
 		}
-		return c.prefetch()
 	}
+	return ret
 
-	if c.mode == OPEN {
-		// prefetch amount is too small, increase it.
-		c.prefetch_amount *= 2
-		if glog.V(2) {
-			glog.Infof("[%d]Prefetch amount increased to: %v", c.id, c.prefetch_amount)
-		}
-		return c.prefetch()
-	}
-	return false
 }
 
 func (c *Cache) findNodeById(id NodeId) *Node {
@@ -160,23 +179,16 @@ func (c *Cache) findNodeById(id NodeId) *Node {
 	return found
 }
 
-func (c *Cache) prefetch() bool {
+func (c *Cache) prefetch(req_amount int, use_not_granted bool) {
 	var node_id NodeId
-	req_amount := c.prefetch_amount
-	if c.mode == OPEN {
-		if req_amount > 1 {
-			// Add the prefetch amount to available queue even before it is
-			// responded. Minus 1 to account for this request.
-			node_id = c.nextNodeId()
-			n := &Node{
-				available: req_amount - 1,
-				id:        node_id,
-			}
-			c.queue.Push(n)
-		} else {
-			// Use special node id=1 to indicate it is OPEN and req_amount=1
-			node_id = 1
+	// add the prefetch amount to available queue before it is granted.
+	if use_not_granted {
+		node_id = c.nextNodeId()
+		n := &Node{
+			available: req_amount,
+			id:        node_id,
 		}
+		c.queue.Push(n)
 	}
 
 	if glog.V(2) {
@@ -189,52 +201,18 @@ func (c *Cache) prefetch() bool {
 	c.server.Alloc(req_amount, func(resp Response) {
 		c.onAllocResponse(node_id, req_amount, resp)
 	})
-
-	return c.mode == OPEN
 }
 
 func (c *Cache) onAllocResponse(node_id NodeId, req_amount int, resp Response) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if glog.V(2) {
-		glog.Infof("[%d]Prefetch(%d) granted: %v", c.id, node_id, resp.amount)
-	}
 	var n *Node
-	if node_id > 1 {
-		// The prefetched amount was added to the available queue
+	// The prefetched amount was added to the available queue
+	if node_id != 0 {
 		n = c.findNodeById(node_id)
-	}
-
-	if resp.amount == req_amount {
-		if c.mode != OPEN {
-			c.mode = OPEN
-			if glog.V(2) {
-				glog.Infof("[%d]Prefetch(%d) change mode to OPEN", c.id, node_id)
-			}
-		}
-	} else {
-		if c.mode != CLOSE {
-			c.mode = CLOSE
-			if glog.V(2) {
-				glog.Infof("[%d]Prefetch(%d) change mode to CLOSE", c.id, node_id)
-			}
-		}
-		delta := req_amount - resp.amount
-
-		// Be conservative, decrease prefetch amount.
-		c.prefetch_amount -= delta
-		if c.prefetch_amount < 1 {
-			c.prefetch_amount = 1
-		}
-		if glog.V(2) {
-			glog.Infof("[%d]Prefetch amount decreased to: %v", c.id, c.prefetch_amount)
-		}
-
-		// The granted amount is less than requested and it has been
-		// added to the available queue at the request time,
-		// substract the delta from the available queue.
-		if node_id > 1 {
+		if resp.amount < req_amount {
+			delta := req_amount - resp.amount
 			// Substract it from its own request node.
 			if n != nil {
 				d := min(n.available, delta)
@@ -251,21 +229,40 @@ func (c *Cache) onAllocResponse(node_id NodeId, req_amount int, resp Response) {
 				}
 			}
 		}
-	}
-
-	// node_id=0 means prefetched amount was not added to the available queue at
-	// request time for CLOSE mode. Add it now.
-	if node_id == 0 && resp.amount > 0 {
-		node_id = c.nextNodeId()
-		n = &Node{
-			available: resp.amount,
-			id:        node_id,
+	} else {
+		if resp.amount > 0 {
+			node_id = c.nextNodeId()
+			n = &Node{
+				available: resp.amount,
+				id:        node_id,
+			}
+			c.queue.Push(n)
 		}
-		c.queue.Push(n)
 	}
 
-	// If granted tokens are not all used, set expiration timer.
+	if glog.V(2) {
+		glog.Infof("[%d]Prefetch(%d) granted: %v", c.id, node_id, resp.amount)
+	}
+	if resp.amount == req_amount {
+		if c.mode != OPEN {
+			c.mode = OPEN
+			if glog.V(2) {
+				glog.Infof("[%d]Prefetch(%d) change mode to OPEN", c.id, node_id)
+			}
+		}
+	} else {
+		if c.mode != CLOSE {
+			c.mode = CLOSE
+			if glog.V(2) {
+				glog.Infof("[%d]Prefetch(%d) change mode to CLOSE", c.id, node_id)
+			}
+		}
+	}
+
 	if n != nil && n.available > 0 {
+		if glog.V(4) {
+			glog.Infof("[%d]add timer to expire id=%d, in: %v second", c.id, node_id, resp.expire)
+		}
 		time.AfterFunc(resp.expire*time.Second, func() {
 			c.onExpire(node_id)
 		})
@@ -278,26 +275,15 @@ func (c *Cache) onExpire(node_id NodeId) {
 
 	// Called when prefetched tokens are expired.
 	n := c.findNodeById(node_id)
-	if n == nil || n.available <= 0 {
+	if n == nil {
 		return
 	}
 
-	// prefetch is too big, adjust it
-	// to actual usage.
-	c.prefetch_amount -= n.available
-	if c.prefetch_amount < 1 {
-		c.prefetch_amount = 1
+	if n.available > 0 {
+		c.s.expired += uint64(n.available)
+		if glog.V(2) {
+			glog.Infof("[%d]===Expired %v from id: %d", c.id, n.available, node_id)
+		}
+		n.available = 0
 	}
-	if glog.V(2) {
-		glog.Infof("[%d]Prefetch amount decreased to: %v", c.id, c.prefetch_amount)
-	}
-
-	c.s.expired += uint64(n.available)
-	glog.Infof("[%d]===Expired %v", c.id, n.available)
-
-	// Wipe out the tokens
-	n.available = 0
-	// If there are token avaiable,
-	// it should be OPEN
-	c.mode = OPEN
 }

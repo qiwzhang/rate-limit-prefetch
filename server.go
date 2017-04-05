@@ -62,8 +62,10 @@ func (d *Delay) empty() bool {
 }
 
 type Server struct {
-	ch chan Request
-	d  *Delay
+	ch         chan Request
+	d          *Delay
+	allowance  float64
+	last_check time.Time
 }
 
 func NewServer() *Server {
@@ -76,22 +78,22 @@ func NewServer() *Server {
 		window := float64(*flag_window)
 		glog.Infof("rate limit: rate=%f, window=%f\n", rate, window)
 
-		allowance := rate
-		last_check := time.Now()
+		s.allowance = rate
+		s.last_check = time.Now()
 		for true {
 			req := <-s.ch
 			curr := time.Now()
-			duration := curr.Sub(last_check)
-			last_check = curr
-			allowance += duration.Seconds() * (rate / window)
-			if allowance > rate {
-				allowance = rate // throttle
+			duration := curr.Sub(s.last_check)
+			s.last_check = curr
+			s.allowance += duration.Seconds() * (rate / window)
+			if s.allowance > rate {
+				s.allowance = rate // throttle
 			}
-			granted := allowance
+			granted := s.allowance
 			if float64(req.amount) < granted {
 				granted = float64(req.amount)
 			}
-			allowance -= granted
+			s.allowance -= granted
 
 			s.d.delay(req.fn, Response{
 				amount: int(granted),
@@ -100,6 +102,11 @@ func NewServer() *Server {
 		}
 	}()
 	return s
+}
+
+func (s *Server) Reset() {
+	s.allowance = 0
+	s.last_check = time.Now().Add(-time.Second)
 }
 
 func (s *Server) Alloc(amount int, fn ResponseFunc) {
