@@ -9,8 +9,11 @@ import (
 
 const (
 	// Count the number of requests in this window
-	// Use that to determine how much to prefetch
-	predictWindowInSeconds = 1
+	// Use the amount to determine how much to prefetch
+	predictWindowInSeconds = 1.0
+
+	// How long to wait for next prefetch if last prefetch fails.
+	closeWaitWindowInSeconds = 0.5
 
 	// Minimum prefetch amount
 	minPrefetchAmount = 10
@@ -18,7 +21,8 @@ const (
 
 var (
 	// Converts to time.Duration type for easy use.
-	predictWindow = time.Duration(predictWindowInSeconds) * time.Second
+	predictWindow   = time.Duration(predictWindowInSeconds * float64(time.Second))
+	closeWaitWindow = time.Duration(closeWaitWindowInSeconds * float64(time.Second))
 
 	// cache_id for logging in multiple cache case
 	cache_id int
@@ -120,7 +124,7 @@ func (c *Cache) tryPrefetch() {
 	// If it is in Close mode, and too close to last request time,
 	// Not issue a new prefetch, most likely will not get any.
 	if c.mode == CLOSE &&
-		time.Since(c.last_prefetch_time) < predictWindow/2 {
+		time.Since(c.last_prefetch_time) < closeWaitWindow {
 		return
 	}
 
